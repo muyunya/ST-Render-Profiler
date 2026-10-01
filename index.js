@@ -124,7 +124,11 @@ function summarizeLoaf(entries) {
             const dur = script.duration || 0;
             scriptTotal += dur;
             forcedLayout += script.forcedStyleAndLayoutDuration || 0;
-            const file = String(script.sourceURL || '(inline)').split('/').pop() || '(inline)';
+            // 只显示文件名会分不清「酒馆自带的 lib.js」和「某个扩展打包出来的 lib.js」，
+            // 这里保留末三级路径，便于直接看出归属。
+            const url = String(script.sourceURL || '(inline)');
+            const segs = url.split('/').filter(Boolean);
+            const file = segs.length > 3 ? '…/' + segs.slice(-3).join('/') : (segs.join('/') || '(inline)');
             const fn = script.sourceFunctionName || '(anonymous)';
             const key = `${file} → ${fn}`;
             bySource.set(key, (bySource.get(key) || 0) + dur);
@@ -285,6 +289,107 @@ async function measureTokenCost(limit = 30) {
         totalMs: +totalMs.toFixed(1),
         avgMs: +(totalMs / texts.length).toFixed(2),
     };
+}
+
+// ---------------------------------------------------------------- 发送路径测量
+
+/**
+ * 测量「发送一条消息」时的开销 —— 这才是随楼层数增长的那部分。
+ *
+ * 为什么单独测：重载聊天是「全部楼层重渲染」（一次性），
+ * 而正常玩时只有新楼层渲染，真正随楼层增长的是**发送前的提示词组装**
+ * （上下文拼接、世界书扫描、正则脚本、分词），它发生在酒馆内部，
+ * 无法直接挂钩函数，但可以用事件把它切成几段分别计时。
+ *
+ * 事件顺序：
+ *   GENERATE_BEFORE_COMBINE_PROMPTS → 组装上下文的起点
+ *   GENERATE_AFTER_COMBINE_PROMPTS  → 上下文拼装完成（随楼层增长的那段）
+ *   GENERATE_AFTER_DATA             → 请求数据就绪（宏/正则/分词多在这一段）
+ *   GENERATION_STARTED / ENDED      → 请求发出 / 结束
+ */
+async function measureGenerationPath(timeoutMs = 180_000) {
+    const E = CTX.eventTypes;
+    const marks = {};
+    const t0 = performance.now();
+    const collector = createCollector();
+    collector.start();
+
+    let resolveDone;
+    const done = new Promise((resolve) => { resolveDone = resolve; });
+
+    const stamp = (key, after) => () => {
+        if (marks[key] === undefined) marks[key] = +(performance.now() - t0).toFixed(1);
+        after?.();
+    };
+    const handlers = [
+        [E.GENERATE_BEFORE_COMBINE_PROMPTS, stamp('contextStart')],
+        [E.GENERATE_AFTER_COMBINE_PROMPTS, stamp('contextDone')],
+        [E.GENERATE_AFTER_DATA, stamp('requestReady')],
+        [E.GENERATION_STARTED, stamp('generationStarted')],
+        [E.GENERATION_ENDED, stamp('generationEnded', () => resolveDone())],
+    ];
+    for (const [ev, fn] of handlers) {
+        try { CTX.eventSource.on(ev, fn); } catch { /* 单个事件不可用不影响其它 */ }
+    }
+
+    setStatus(`监听中：现在去发送任意一条消息（最多等 ${Math.round(timeoutMs / 1000)} 秒）…`);
+    const finished = await Promise.race([
+        done.then(() => true),
+        sleep(timeoutMs).then(() => false),
+    ]);
+
+    for (const [ev, fn] of handlers) {
+        try { CTX.eventSource.removeListener(ev, fn); } catch { /* noop */ }
+    }
+    await sleep(300);
+    collector.stop();
+
+    const span = (a, b) => (marks[a] !== undefined && marks[b] !== undefined)
+        ? +(marks[b] - marks[a]).toFixed(1) : null;
+
+    return {
+        label: '发送路径测量',
+        finished,
+        marks,
+        contextBuildMs: span('contextStart', 'contextDone'),      // ← 随楼层增长
+        postProcessMs: span('contextDone', 'requestReady'),
+        dispatchMs: span('requestReady', 'generationStarted'),
+        generationMs: span('generationStarted', 'generationEnded'),
+        totalMs: marks.generationEnded ?? null,
+        loaf: summarizeLoaf(collector.state.loaf),
+        longtask: {
+            count: collector.state.longtask.length,
+            totalMs: +collector.state.longtask.reduce((a, t) => a + t.duration, 0).toFixed(1),
+        },
+        supported: collector.state.supported,
+        env: {
+            ua: navigator.userAgent,
+            viewport: `${window.innerWidth}×${window.innerHeight}`,
+        },
+    };
+}
+
+function formatGeneration(g) {
+    const L = g.loaf;
+    const lines = [];
+    lines.push('── 发送路径测量 ──');
+    if (!g.finished) {
+        lines.push('  ⚠ 超时未捕获到完整生成流程（是否取消了发送？）');
+    }
+    lines.push(`  上下文组装    : ${g.contextBuildMs ?? 'n/a'} ms   ← 随楼层数增长的就是这一段`);
+    lines.push(`  后处理(宏/正则/分词): ${g.postProcessMs ?? 'n/a'} ms`);
+    lines.push(`  请求派发      : ${g.dispatchMs ?? 'n/a'} ms`);
+    lines.push(`  等待模型返回  : ${g.generationMs ?? 'n/a'} ms   （这段时间在等 API，不是本地开销）`);
+    lines.push(`  从点击到返回  : ${g.totalMs ?? 'n/a'} ms`);
+    if (L.frames > 0) {
+        lines.push(`  期间长帧      : ${L.frames} 个（总 ${L.frameTotalMs} ms，阻塞 ${L.blockingMs} ms）`);
+        lines.push(`  脚本 ${L.scriptMs} ms (${L.scriptShare ?? '?'}%)   样式+布局 ${L.styleLayoutMs} ms (${L.styleLayoutShare ?? '?'}%)`);
+        for (const t of (L.topScripts || []).slice(0, 6)) {
+            lines.push(`      ${pad(t.ms + ' ms', 10)} ${t.name}`);
+        }
+    }
+    lines.push('');
+    return lines.join('\n');
 }
 
 /** 跑一整轮测量 */
@@ -460,6 +565,14 @@ async function withLock(fn) {
     }
 }
 
+async function runGeneration() {
+    const gen = await measureGenerationPath();
+    const text = formatGeneration(gen) + verdict([gen]);
+    lastReport = JSON.stringify({ version: 2, sessions: [gen] }, null, 2);
+    appendOutput(text);
+    setStatus(gen.finished ? '完成。' : '超时结束（可以再点一次）。');
+}
+
 async function runSingle() {
     const opts = collectOptions();
     const session = await runSession({ label: '当前设置测量', suppressContentVisibility: false, ...opts });
@@ -505,6 +618,7 @@ jQuery(async () => {
         container?.insertAdjacentHTML('beforeend', html);
 
         document.getElementById('st-rp-run')?.addEventListener('click', () => withLock(runSingle));
+        document.getElementById('st-rp-gen')?.addEventListener('click', () => withLock(runGeneration));
         document.getElementById('st-rp-ab')?.addEventListener('click', () => withLock(runAb));
         document.getElementById('st-rp-copy')?.addEventListener('click', () => withLock(copyReport));
         document.getElementById('st-rp-clear')?.addEventListener('click', () => {
