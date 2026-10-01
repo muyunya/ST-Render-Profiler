@@ -1,0 +1,50 @@
+.st-rp-desc {
+    font-size: 0.9em;
+    opacity: 0.85;
+    margin: 4px 0 8px 0;
+    line-height: 1.5;
+}
+
+.st-rp-row {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    margin-bottom: 6px;
+}
+
+.st-rp-options {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin: 6px 0;
+    font-size: 0.9em;
+}
+
+.st-rp-status {
+    font-size: 0.9em;
+    opacity: 0.9;
+    margin: 8px 0 4px 0;
+    min-height: 1.2em;
+}
+
+.st-rp-output {
+    max-height: 340px;
+    overflow: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.8em;
+    line-height: 1.45;
+    padding: 8px;
+    margin: 0;
+    border-radius: 5px;
+    background-color: rgba(0, 0, 0, 0.25);
+}
+
+.st-rp-good {
+    color: #6ee7a8;
+}
+
+.st-rp-warn {
+    color: #f0c674;
+}

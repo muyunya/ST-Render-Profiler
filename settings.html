@@ -1,0 +1,53 @@
+<div class="st-rp-drawer">
+    <div class="inline-drawer">
+        <div class="inline-drawer-toggle inline-drawer-header">
+            <b>Render Profiler · 渲染体检</b>
+            <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+        </div>
+        <div class="inline-drawer-content">
+            <p class="st-rp-desc">
+                测量聊天页面的渲染开销，并区分<b>脚本耗时</b>与<b>样式/布局耗时</b>，
+                用来判断「该优化 JS 还是该优化布局」。
+            </p>
+
+            <div class="st-rp-row">
+                <button id="st-rp-run" class="menu_button">
+                    <i class="fa-solid fa-gauge-high"></i> 开始测量（当前设置）
+                </button>
+            </div>
+
+            <div class="st-rp-row">
+                <button id="st-rp-ab" class="menu_button">
+                    <i class="fa-solid fa-code-compare"></i> A/B 对比（屏外跳过 开 / 关）
+                </button>
+            </div>
+
+            <div class="st-rp-options">
+                <label class="checkbox_label">
+                    <input type="checkbox" id="st-rp-scroll" checked>
+                    <span>包含滚动帧率测试（约 3 秒）</span>
+                </label>
+                <label class="checkbox_label">
+                    <input type="checkbox" id="st-rp-token">
+                    <span>包含分词耗时测试（可能较慢）</span>
+                </label>
+                <label class="checkbox_label">
+                    <input type="checkbox" id="st-rp-reload" checked>
+                    <span>测量前重新加载聊天（更准确）</span>
+                </label>
+            </div>
+
+            <div class="st-rp-row">
+                <button id="st-rp-copy" class="menu_button">
+                    <i class="fa-solid fa-clipboard"></i> 复制报告
+                </button>
+                <button id="st-rp-clear" class="menu_button">
+                    <i class="fa-solid fa-eraser"></i> 清空
+                </button>
+            </div>
+
+            <div id="st-rp-status" class="st-rp-status">就绪。</div>
+            <pre id="st-rp-output" class="st-rp-output"></pre>
+        </div>
+    </div>
+</div>

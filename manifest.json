@@ -1,0 +1,12 @@
+{
+    "display_name": "Render Profiler (渲染体检)",
+    "loading_order": 900,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "muyunya",
+    "version": "1.0.0",
+    "homePage": "https://github.com/muyunya/ST-Render-Profiler",
+    "auto_update": true
+}
