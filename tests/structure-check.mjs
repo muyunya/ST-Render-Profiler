@@ -37,6 +37,10 @@ function funcBody(name) {
 }
 
 const probeModule = src.slice(0, src.indexOf('function pad('));
+
+// 从源码里把候选清单抽出来做结构校验（不执行模块，避免依赖浏览器环境）
+const PROBE_TARGETS = [...src.matchAll(/^\s*\['([^']+)', \(\) => .*?, '([^']+)'\],$/gm)]
+    .map((m) => [m[1], null, m[2]]);
 const runSession = funcBody('runSession');
 const formatSession = funcBody('formatSession');
 const generationPath = funcBody('measureGenerationPath');
@@ -49,6 +53,11 @@ const checks = [
     ['runSession 的返回对象含 probes', /^\s+probes,$/m.test(runSession)],
     ['生成路径没有引用未定义的 probes', !/\bprobes\b/.test(generationPath)],
     ['formatSession 会输出探针区块', formatSession.includes('s.probes')],
+    ['候选清单是模块级的唯一一份', (src.match(/const PROBE_TARGETS = \[/g) || []).length === 1
+        && !/const targets = \[/.test(src)],
+    ['候选清单非空且条目结构正确', PROBE_TARGETS.length >= 10
+        && PROBE_TARGETS.every((item) => Array.isArray(item) && item.length === 3 && typeof item[0] === 'string')],
+    ['会话报告里带上了候选清单名', runSession.includes('probeTargets')],
 ];
 
 let rest = src;

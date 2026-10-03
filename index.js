@@ -18,6 +18,21 @@
  */
 
 import { extension_settings, getContext, renderExtensionTemplateAsync } from '../../../extensions.js';
+// lib.js 是酒馆的库集合模块（webpack 打包 + ES 模块导出）。
+// 业务代码 import { lodash, css, ... } from '../lib.js' 拿到的就是这里的同一份实例，
+// 所以包住这些对象的方法，就能测到真实渲染路径上的调用 —— 而 LoAF 只能告诉我们
+// 「代码在 lib.js 里」，那里面有 24 个库，靠猜是浪费时间。
+// 用动态 import 而不是静态 import：静态导入一旦失败（路径变化、被拦截），
+// 整个扩展模块都会加载不了 —— 测量工具不该有这种风险。失败时降级为只包
+// window 上暴露的那几个库，功能少一点，但绝不会把面板搞没。
+let STLib = {};
+(async () => {
+    try {
+        STLib = await import('/lib.js');
+    } catch (error) {
+        console.warn('[ST-Render-Profiler] 无法导入 /lib.js，探针降级为只覆盖 window 上的库', error);
+    }
+})();
 import { saveSettingsDebounced } from '../../../../script.js';
 
 const MODULE_NAME = 'ST-Render-Profiler';
@@ -83,18 +98,49 @@ function wrapMethod(target, key, name, { wrapResult = false } = {}) {
     return true;
 }
 
+    // 候选清单：覆盖 lib.js 里所有可能出现在「每条消息」路径上的库操作。
+    // 每一项都是 [显示名, () => 承载对象, 方法名] —— 取对象用函数是为了容忍
+    // 某些导出在某些版本里不存在（拿不到就跳过，不报错）。
+const PROBE_TARGETS = [
+        ['DOMPurify.sanitize', () => STLib.DOMPurify, 'sanitize'],
+        ['css.parse（样式解析）', () => STLib.css, 'parse'],
+        ['showdown.makeHtml', () => STLib.showdown?.Converter?.prototype, 'makeHtml'],
+        ['lodash.cloneDeep', () => STLib.lodash, 'cloneDeep'],
+        ['lodash.isEqual', () => STLib.lodash, 'isEqual'],
+        ['lodash.merge', () => STLib.lodash, 'merge'],
+        ['lodash.clone', () => STLib.lodash, 'clone'],
+        ['lodash.get', () => STLib.lodash, 'get'],
+        ['lodash.set', () => STLib.lodash, 'set'],
+        ['lodash.debounce', () => STLib.lodash, 'debounce'],
+        ['lodash.uniqBy', () => STLib.lodash, 'uniqBy'],
+        ['lodash.sortBy', () => STLib.lodash, 'sortBy'],
+        ['lodash.throttle', () => STLib.lodash, 'throttle'],
+        ['sha256.array', () => STLib.sha256, 'array'],
+        ['localforage.getItem', () => STLib.localforage, 'getItem'],
+        ['localforage.setItem', () => STLib.localforage, 'setItem'],
+        ['Fuse.search', () => STLib.Fuse?.prototype, 'search'],
+        ['DiffMatchPatch.diff_main', () => STLib.DiffMatchPatch?.prototype, 'diff_main'],
+        ['SVGInject', () => window, 'SVGInject'],
+        ['hljs.highlightElement', () => window.hljs, 'highlightElement'],
+        ['Handlebars.compile', () => window.Handlebars, 'compile'],
+    ];
+
 function installLibraryProbes() {
     if (probesInstalled) return true;
-    const okPurify = wrapMethod(window.DOMPurify, 'sanitize', 'DOMPurify.sanitize');
-    // 只数「编译」次数，不包装它产出的模板函数：
-    // 编译本身就比渲染贵得多，而包装返回值（Object.assign 复制属性）有弄坏模板的风险，
-    // 对一个「测量工具」来说不值得 —— 宁可少一个数字，也不能把用户的页面搞坏。
-    const okHandlebars = wrapMethod(window.Handlebars, 'compile', 'Handlebars.compile');
-    const okHljs = wrapMethod(window.hljs, 'highlightElement', 'hljs.highlightElement')
-        || wrapMethod(window.hljs, 'highlight', 'hljs.highlight');
-    probesInstalled = okPurify || okHandlebars || okHljs;
+
+    const targets = PROBE_TARGETS;
+    let installed = 0;
+    for (const [name, getTarget, key] of targets) {
+        try {
+            if (wrapMethod(getTarget(), key, name)) installed += 1;
+        } catch {
+            // 某个库拿不到就跳过，不影响其它探针
+        }
+    }
+    // 只有全部装上才算完成：动态 import 可能比首次安装晚一步就绪，
+    // 未装全就安排一次重试，避免「探针静默少测几项」。
+    probesInstalled = installed >= PROBE_TARGETS.length;
     if (!probesInstalled) {
-        // 页面脚本可能还没就绪，稍后重试
         setTimeout(() => { probesInstalled = false; installLibraryProbes(); }, 1500);
     }
     return probesInstalled;
@@ -515,6 +561,7 @@ async function runSession({ label, suppressContentVisibility, includeScroll, inc
         scroll,
         token,
         probes,
+        probeTargets: PROBE_TARGETS.map(([name]) => name),
         loaf: summarizeLoaf(collector.state.loaf),
         longtask: longtaskSummary,
         supported: collector.state.supported,
@@ -551,7 +598,7 @@ function formatSession(s) {
         for (const probe of s.probes) {
             lines.push(`    ${pad(probe.name, 34)} ${pad(`${probe.calls} 次`, 10)} ${pad(`${probe.totalMs} ms`, 12)} 每次 ${probe.perCallMs} ms`);
         }
-        const silent = ['DOMPurify.sanitize', 'Handlebars.compile']
+        const silent = (s.probeTargets || [])
             .filter((name) => !s.probes.some((probe) => probe.name === name));
         if (silent.length) {
             lines.push(`    未触发: ${silent.join('、')}（说明不是瓶颈）`);
