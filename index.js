@@ -246,6 +246,7 @@ function summarizeLoaf(entries) {
     let blockingTotal = 0;
     let forcedLayout = 0;
     const bySource = new Map();
+    const byPosition = new Map();
 
     for (const entry of entries) {
         frameTotal += entry.duration || 0;
@@ -265,6 +266,12 @@ function summarizeLoaf(entries) {
             const fn = script.sourceFunctionName || '(anonymous)';
             const key = `${file} → ${fn}`;
             bySource.set(key, (bySource.get(key) || 0) + dur);
+            // 记下字符偏移：压缩包里的代码只有靠它才能定位到具体模块
+            if (typeof script.sourceCharPosition === 'number') {
+                const list = byPosition.get(key) || [];
+                list.push({ url, position: script.sourceCharPosition, ms: dur });
+                byPosition.set(key, list);
+            }
         }
     }
 
@@ -282,7 +289,63 @@ function summarizeLoaf(entries) {
         scriptShare: denom > 0 ? +(scriptTotal / denom * 100).toFixed(1) : null,
         styleLayoutShare: denom > 0 ? +(styleLayoutTotal / denom * 100).toFixed(1) : null,
         topScripts: top,
+        // 每个热点的「代码位置样本」，供后续解析成模块片段（异步补上）
+        positionSamples: [...byPosition.entries()]
+            .sort((a, b) => b[1].reduce((x, y) => x + y.ms, 0) - a[1].reduce((x, y) => x + y.ms, 0))
+            .slice(0, 4)
+            .map(([key, list]) => ({ key, samples: list.slice(0, 3) })),
     };
+}
+
+// ---------------------------------------------------------------- 压缩包定位
+//
+// 酒馆的 /lib.js 是 1.9MB 的 webpack 压缩包（没有 source map），
+// 但 LoAF 会给出 sourceCharPosition —— 脚本内的字符偏移。
+// webpack 压缩后每个模块仍有边界（形如 `,6893(e){`），
+// 于是可以据此反查「这段代码属于哪个模块」，并把模块开头一段代码取出来 ——
+// 比在 24 个库里挨个猜快得多。
+const scriptCache = new Map();
+
+function fetchScriptText(url) {
+    if (!scriptCache.has(url)) {
+        scriptCache.set(url, fetch(url).then((r) => (r.ok ? r.text() : '')).catch(() => ''));
+    }
+    return scriptCache.get(url);
+}
+
+async function describePosition(url, position) {
+    if (!url || typeof position !== 'number' || position < 0) return null;
+    const source = await fetchScriptText(url);
+    if (!source) return null;
+    const before = source.slice(0, position);
+    const headerRe = /[,{;]\s*(\d{2,6})\s*[:(]/g;
+    let last = null;
+    let match;
+    while ((match = headerRe.exec(before)) !== null) last = match;
+    if (!last) return null;
+    const snippet = source.slice(last.index, last.index + 180).replace(/\s+/g, ' ');
+    return {
+        moduleId: last[1],
+        offsetInModule: position - last.index,
+        snippet,
+    };
+}
+
+/** 给报告里的热点补上「模块片段」，让压缩代码也能被认出来 */
+async function enrichWithModuleHints(loafSummary) {
+    const hints = [];
+    for (const item of loafSummary.positionSamples || []) {
+        for (const sample of item.samples) {
+            try {
+                const hint = await describePosition(sample.url, sample.position);
+                if (hint) {
+                    hints.push({ key: item.key, ms: +sample.ms.toFixed(1), ...hint });
+                    break;
+                }
+            } catch { /* 单个样本解析失败不影响其它 */ }
+        }
+    }
+    return hints;
 }
 
 /**
@@ -546,6 +609,9 @@ async function runSession({ label, suppressContentVisibility, includeScroll, inc
     setContentVisibilitySuppressed(false);
 
     const probes = stopProbes();
+    const loafSummary = summarizeLoaf(collector.state.loaf);
+    let moduleHints = [];
+    try { moduleHints = await enrichWithModuleHints(loafSummary); } catch { /* noop */ }
     const longtasks = collector.state.longtask;
     const longtaskSummary = {
         count: longtasks.length,
@@ -592,6 +658,15 @@ function formatSession(s) {
 
     // 库调用探针：LoAF 只能给到文件名，lib.js 里全是 (anonymous)，
     // 这一段直接给出「谁被调了多少次、共花了多少毫秒」
+    if (Array.isArray(s.moduleHints) && s.moduleHints.length) {
+        lines.push('');
+        lines.push('  压缩包定位（lib.js 里的模块片段）:');
+        for (const hint of s.moduleHints) {
+            lines.push(`    ${hint.key}  ${hint.ms} ms  → 模块 ${hint.moduleId}（+${hint.offsetInModule}）`);
+            lines.push(`      ${hint.snippet.slice(0, 110)}`);
+        }
+    }
+
     if (Array.isArray(s.probes) && s.probes.length) {
         lines.push('');
         lines.push('  库调用探针（真实渲染路径）:');
