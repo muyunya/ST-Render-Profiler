@@ -444,7 +444,6 @@ async function measureGenerationPath(timeoutMs = 180_000) {
         generationMs: span('generationStarted', 'generationEnded'),
         totalMs: marks.generationEnded ?? null,
         loaf: summarizeLoaf(collector.state.loaf),
-        probes,
         longtask: {
             count: collector.state.longtask.length,
             totalMs: +collector.state.longtask.reduce((a, t) => a + t.duration, 0).toFixed(1),
@@ -515,6 +514,7 @@ async function runSession({ label, suppressContentVisibility, includeScroll, inc
         render,
         scroll,
         token,
+        probes,
         loaf: summarizeLoaf(collector.state.loaf),
         longtask: longtaskSummary,
         supported: collector.state.supported,
