@@ -32,6 +32,89 @@ const defaultSettings = {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// ---------------------------------------------------------------- 库调用探针
+//
+// LoAF 只能告诉我们「哪个文件」，而 webpack 打出来的 lib.js 里全是 (anonymous)，
+// 光看文件名分不清是 DOMPurify、Handlebars 还是 hljs —— 这三者的优化方向完全不同
+// （前者要缓存结果，后者要减少调用）。所以这里把这些库函数包一层，
+// 统计**真实渲染路径**上的调用次数与耗时，让数据直接说出是谁。
+//
+// 包装是幂等的；测量之外只多一次函数调用，对结果的影响远小于它要解释的那几千毫秒。
+const probeStats = new Map();
+let probesActive = false;
+let probesInstalled = false;
+
+function recordProbe(name, ms) {
+    if (!probesActive) return;
+    const cur = probeStats.get(name) || { calls: 0, totalMs: 0 };
+    cur.calls += 1;
+    cur.totalMs += ms;
+    probeStats.set(name, cur);
+}
+
+function wrapMethod(target, key, name, { wrapResult = false } = {}) {
+    const original = target?.[key];
+    if (typeof original !== 'function') return false;
+    target[key] = function (...args) {
+        if (!probesActive) return original.apply(this, args);
+        const t0 = performance.now();
+        let result;
+        try {
+            result = original.apply(this, args);
+        } finally {
+            recordProbe(name, performance.now() - t0);
+        }
+        if (wrapResult && typeof result === 'function') {
+            const inner = result;
+            const wrapped = function (...innerArgs) {
+                if (!probesActive) return inner.apply(this, innerArgs);
+                const t1 = performance.now();
+                try {
+                    return inner.apply(this, innerArgs);
+                } finally {
+                    recordProbe(`${name} → 渲染`, performance.now() - t1);
+                }
+            };
+            Object.assign(wrapped, inner);
+            return wrapped;
+        }
+        return result;
+    };
+    return true;
+}
+
+function installLibraryProbes() {
+    if (probesInstalled) return true;
+    const okPurify = wrapMethod(window.DOMPurify, 'sanitize', 'DOMPurify.sanitize');
+    const okHandlebars = wrapMethod(window.Handlebars, 'compile', 'Handlebars.compile', { wrapResult: true });
+    const okHljs = wrapMethod(window.hljs, 'highlightElement', 'hljs.highlightElement')
+        || wrapMethod(window.hljs, 'highlight', 'hljs.highlight');
+    probesInstalled = okPurify || okHandlebars || okHljs;
+    if (!probesInstalled) {
+        // 页面脚本可能还没就绪，稍后重试
+        setTimeout(() => { probesInstalled = false; installLibraryProbes(); }, 1500);
+    }
+    return probesInstalled;
+}
+
+function startProbes() {
+    installLibraryProbes();
+    probeStats.clear();
+    probesActive = true;
+}
+
+function stopProbes() {
+    probesActive = false;
+    return [...probeStats.entries()]
+        .map(([name, v]) => ({
+            name,
+            calls: v.calls,
+            totalMs: +v.totalMs.toFixed(1),
+            perCallMs: +(v.totalMs / Math.max(1, v.calls)).toFixed(3),
+        }))
+        .sort((a, b) => b.totalMs - a.totalMs);
+}
+
 /** 统计一棵子树里的元素节点数（含自身） */
 function countNodes(root) {
     if (!root) return 0;
@@ -357,6 +440,7 @@ async function measureGenerationPath(timeoutMs = 180_000) {
         generationMs: span('generationStarted', 'generationEnded'),
         totalMs: marks.generationEnded ?? null,
         loaf: summarizeLoaf(collector.state.loaf),
+        probes,
         longtask: {
             count: collector.state.longtask.length,
             totalMs: +collector.state.longtask.reduce((a, t) => a + t.duration, 0).toFixed(1),
@@ -401,6 +485,7 @@ async function runSession({ label, suppressContentVisibility, includeScroll, inc
 
     const collector = createCollector();
     const domBefore = domStats();
+    startProbes();
     collector.start();
 
     const render = await measureChatRender({ reload });
@@ -411,6 +496,7 @@ async function runSession({ label, suppressContentVisibility, includeScroll, inc
     collector.stop();
     setContentVisibilitySuppressed(false);
 
+    const probes = stopProbes();
     const longtasks = collector.state.longtask;
     const longtaskSummary = {
         count: longtasks.length,
@@ -452,6 +538,21 @@ function formatSession(s) {
     lines.push(`  屏外跳过(content-visibility): ${s.contentVisibility}`);
     lines.push(`  楼层数        : ${s.dom.messages}      聊天区节点: ${s.dom.chatNodes}      全文档节点: ${s.dom.documentNodes}`);
     lines.push(`  整轮渲染      : ${s.render.totalMs} ms   重载: ${s.render.reloadMs ?? 'n/a'} ms   CHAT_LOADED: ${s.render.chatLoadedMs ?? 'n/a'} ms   触发渲染楼层: ${s.render.renderedMessages}   每层约: ${s.render.perMessageMs ?? 'n/a'} ms`);
+
+    // 库调用探针：LoAF 只能给到文件名，lib.js 里全是 (anonymous)，
+    // 这一段直接给出「谁被调了多少次、共花了多少毫秒」
+    if (Array.isArray(s.probes) && s.probes.length) {
+        lines.push('');
+        lines.push('  库调用探针（真实渲染路径）:');
+        for (const probe of s.probes) {
+            lines.push(`    ${pad(probe.name, 34)} ${pad(`${probe.calls} 次`, 10)} ${pad(`${probe.totalMs} ms`, 12)} 每次 ${probe.perCallMs} ms`);
+        }
+        const silent = ['DOMPurify.sanitize', 'Handlebars.compile', 'Handlebars.compile → 渲染']
+            .filter((name) => !s.probes.some((probe) => probe.name === name));
+        if (silent.length) {
+            lines.push(`    未触发: ${silent.join('、')}（说明不是瓶颈）`);
+        }
+    }
 
     if (L.frames > 0) {
         lines.push(`  长帧数量      : ${L.frames} 个（总 ${L.frameTotalMs} ms，其中阻塞 ${L.blockingMs} ms）`);
@@ -577,7 +678,7 @@ async function runSingle() {
     const opts = collectOptions();
     const session = await runSession({ label: '当前设置测量', suppressContentVisibility: false, ...opts });
     const text = formatSession(session) + verdict([session]);
-    lastReport = JSON.stringify({ version: 1, sessions: [session] }, null, 2);
+    lastReport = JSON.stringify({ version: 2, sessions: [session] }, null, 2);
     appendOutput(text);
     setStatus('完成。');
 }
