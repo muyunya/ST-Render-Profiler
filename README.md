@@ -71,3 +71,21 @@ https://github.com/muyunya/ST-Render-Profiler
 ## 许可
 
 MIT
+
+## 精确定位：文件级归因不够用时
+
+LoAF 的 `scripts[].sourceURL` 只能给到**文件级**，而且实测会严重偏离 ——
+曾把 5616 ms 归给酒馆自带的 `lib.js`，而 V8 函数级采样里该文件只占 0.6%。
+需要定位到**函数**时，用 `tools/` 下的脚本（不需要人工点按钮）：
+
+```bash
+# 方式一：无头浏览器 + V8 采样（整体排名）
+bash tools/profile-page.sh 60
+node tools/v8-analyze.mjs <日志文件>
+
+# 方式二：CDP 采集 CPU profile（带函数名与行号，可自动打开指定聊天）
+python3 tools/cdp-profile.py profile "<聊天文件名>" "<角色名>" 15
+node tools/analyze-cdp-profile.mjs /tmp/cdp-profile.json
+```
+
+实测结论与优化建议见 `docs/PERF-REPORT.md`。

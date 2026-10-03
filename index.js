@@ -18,21 +18,6 @@
  */
 
 import { extension_settings, getContext, renderExtensionTemplateAsync } from '../../../extensions.js';
-// lib.js 是酒馆的库集合模块（webpack 打包 + ES 模块导出）。
-// 业务代码 import { lodash, css, ... } from '../lib.js' 拿到的就是这里的同一份实例，
-// 所以包住这些对象的方法，就能测到真实渲染路径上的调用 —— 而 LoAF 只能告诉我们
-// 「代码在 lib.js 里」，那里面有 24 个库，靠猜是浪费时间。
-// 用动态 import 而不是静态 import：静态导入一旦失败（路径变化、被拦截），
-// 整个扩展模块都会加载不了 —— 测量工具不该有这种风险。失败时降级为只包
-// window 上暴露的那几个库，功能少一点，但绝不会把面板搞没。
-let STLib = {};
-(async () => {
-    try {
-        STLib = await import('/lib.js');
-    } catch (error) {
-        console.warn('[ST-Render-Profiler] 无法导入 /lib.js，探针降级为只覆盖 window 上的库', error);
-    }
-})();
 import { saveSettingsDebounced } from '../../../../script.js';
 
 const MODULE_NAME = 'ST-Render-Profiler';
@@ -98,49 +83,18 @@ function wrapMethod(target, key, name, { wrapResult = false } = {}) {
     return true;
 }
 
-    // 候选清单：覆盖 lib.js 里所有可能出现在「每条消息」路径上的库操作。
-    // 每一项都是 [显示名, () => 承载对象, 方法名] —— 取对象用函数是为了容忍
-    // 某些导出在某些版本里不存在（拿不到就跳过，不报错）。
-const PROBE_TARGETS = [
-        ['DOMPurify.sanitize', () => STLib.DOMPurify, 'sanitize'],
-        ['css.parse（样式解析）', () => STLib.css, 'parse'],
-        ['showdown.makeHtml', () => STLib.showdown?.Converter?.prototype, 'makeHtml'],
-        ['lodash.cloneDeep', () => STLib.lodash, 'cloneDeep'],
-        ['lodash.isEqual', () => STLib.lodash, 'isEqual'],
-        ['lodash.merge', () => STLib.lodash, 'merge'],
-        ['lodash.clone', () => STLib.lodash, 'clone'],
-        ['lodash.get', () => STLib.lodash, 'get'],
-        ['lodash.set', () => STLib.lodash, 'set'],
-        ['lodash.debounce', () => STLib.lodash, 'debounce'],
-        ['lodash.uniqBy', () => STLib.lodash, 'uniqBy'],
-        ['lodash.sortBy', () => STLib.lodash, 'sortBy'],
-        ['lodash.throttle', () => STLib.lodash, 'throttle'],
-        ['sha256.array', () => STLib.sha256, 'array'],
-        ['localforage.getItem', () => STLib.localforage, 'getItem'],
-        ['localforage.setItem', () => STLib.localforage, 'setItem'],
-        ['Fuse.search', () => STLib.Fuse?.prototype, 'search'],
-        ['DiffMatchPatch.diff_main', () => STLib.DiffMatchPatch?.prototype, 'diff_main'],
-        ['SVGInject', () => window, 'SVGInject'],
-        ['hljs.highlightElement', () => window.hljs, 'highlightElement'],
-        ['Handlebars.compile', () => window.Handlebars, 'compile'],
-    ];
-
 function installLibraryProbes() {
     if (probesInstalled) return true;
-
-    const targets = PROBE_TARGETS;
-    let installed = 0;
-    for (const [name, getTarget, key] of targets) {
-        try {
-            if (wrapMethod(getTarget(), key, name)) installed += 1;
-        } catch {
-            // 某个库拿不到就跳过，不影响其它探针
-        }
-    }
-    // 只有全部装上才算完成：动态 import 可能比首次安装晚一步就绪，
-    // 未装全就安排一次重试，避免「探针静默少测几项」。
-    probesInstalled = installed >= PROBE_TARGETS.length;
+    const okPurify = wrapMethod(window.DOMPurify, 'sanitize', 'DOMPurify.sanitize');
+    // 只数「编译」次数，不包装它产出的模板函数：
+    // 编译本身就比渲染贵得多，而包装返回值（Object.assign 复制属性）有弄坏模板的风险，
+    // 对一个「测量工具」来说不值得 —— 宁可少一个数字，也不能把用户的页面搞坏。
+    const okHandlebars = wrapMethod(window.Handlebars, 'compile', 'Handlebars.compile');
+    const okHljs = wrapMethod(window.hljs, 'highlightElement', 'hljs.highlightElement')
+        || wrapMethod(window.hljs, 'highlight', 'hljs.highlight');
+    probesInstalled = okPurify || okHandlebars || okHljs;
     if (!probesInstalled) {
+        // 页面脚本可能还没就绪，稍后重试
         setTimeout(() => { probesInstalled = false; installLibraryProbes(); }, 1500);
     }
     return probesInstalled;
@@ -246,7 +200,6 @@ function summarizeLoaf(entries) {
     let blockingTotal = 0;
     let forcedLayout = 0;
     const bySource = new Map();
-    const byPosition = new Map();
 
     for (const entry of entries) {
         frameTotal += entry.duration || 0;
@@ -266,12 +219,6 @@ function summarizeLoaf(entries) {
             const fn = script.sourceFunctionName || '(anonymous)';
             const key = `${file} → ${fn}`;
             bySource.set(key, (bySource.get(key) || 0) + dur);
-            // 记下字符偏移：压缩包里的代码只有靠它才能定位到具体模块
-            if (typeof script.sourceCharPosition === 'number') {
-                const list = byPosition.get(key) || [];
-                list.push({ url, position: script.sourceCharPosition, ms: dur });
-                byPosition.set(key, list);
-            }
         }
     }
 
@@ -289,63 +236,7 @@ function summarizeLoaf(entries) {
         scriptShare: denom > 0 ? +(scriptTotal / denom * 100).toFixed(1) : null,
         styleLayoutShare: denom > 0 ? +(styleLayoutTotal / denom * 100).toFixed(1) : null,
         topScripts: top,
-        // 每个热点的「代码位置样本」，供后续解析成模块片段（异步补上）
-        positionSamples: [...byPosition.entries()]
-            .sort((a, b) => b[1].reduce((x, y) => x + y.ms, 0) - a[1].reduce((x, y) => x + y.ms, 0))
-            .slice(0, 4)
-            .map(([key, list]) => ({ key, samples: list.slice(0, 3) })),
     };
-}
-
-// ---------------------------------------------------------------- 压缩包定位
-//
-// 酒馆的 /lib.js 是 1.9MB 的 webpack 压缩包（没有 source map），
-// 但 LoAF 会给出 sourceCharPosition —— 脚本内的字符偏移。
-// webpack 压缩后每个模块仍有边界（形如 `,6893(e){`），
-// 于是可以据此反查「这段代码属于哪个模块」，并把模块开头一段代码取出来 ——
-// 比在 24 个库里挨个猜快得多。
-const scriptCache = new Map();
-
-function fetchScriptText(url) {
-    if (!scriptCache.has(url)) {
-        scriptCache.set(url, fetch(url).then((r) => (r.ok ? r.text() : '')).catch(() => ''));
-    }
-    return scriptCache.get(url);
-}
-
-async function describePosition(url, position) {
-    if (!url || typeof position !== 'number' || position < 0) return null;
-    const source = await fetchScriptText(url);
-    if (!source) return null;
-    const before = source.slice(0, position);
-    const headerRe = /[,{;]\s*(\d{2,6})\s*[:(]/g;
-    let last = null;
-    let match;
-    while ((match = headerRe.exec(before)) !== null) last = match;
-    if (!last) return null;
-    const snippet = source.slice(last.index, last.index + 180).replace(/\s+/g, ' ');
-    return {
-        moduleId: last[1],
-        offsetInModule: position - last.index,
-        snippet,
-    };
-}
-
-/** 给报告里的热点补上「模块片段」，让压缩代码也能被认出来 */
-async function enrichWithModuleHints(loafSummary) {
-    const hints = [];
-    for (const item of loafSummary.positionSamples || []) {
-        for (const sample of item.samples) {
-            try {
-                const hint = await describePosition(sample.url, sample.position);
-                if (hint) {
-                    hints.push({ key: item.key, ms: +sample.ms.toFixed(1), ...hint });
-                    break;
-                }
-            } catch { /* 单个样本解析失败不影响其它 */ }
-        }
-    }
-    return hints;
 }
 
 /**
@@ -553,6 +444,7 @@ async function measureGenerationPath(timeoutMs = 180_000) {
         generationMs: span('generationStarted', 'generationEnded'),
         totalMs: marks.generationEnded ?? null,
         loaf: summarizeLoaf(collector.state.loaf),
+        probes,
         longtask: {
             count: collector.state.longtask.length,
             totalMs: +collector.state.longtask.reduce((a, t) => a + t.duration, 0).toFixed(1),
@@ -609,9 +501,6 @@ async function runSession({ label, suppressContentVisibility, includeScroll, inc
     setContentVisibilitySuppressed(false);
 
     const probes = stopProbes();
-    const loafSummary = summarizeLoaf(collector.state.loaf);
-    let moduleHints = [];
-    try { moduleHints = await enrichWithModuleHints(loafSummary); } catch { /* noop */ }
     const longtasks = collector.state.longtask;
     const longtaskSummary = {
         count: longtasks.length,
@@ -626,8 +515,6 @@ async function runSession({ label, suppressContentVisibility, includeScroll, inc
         render,
         scroll,
         token,
-        probes,
-        probeTargets: PROBE_TARGETS.map(([name]) => name),
         loaf: summarizeLoaf(collector.state.loaf),
         longtask: longtaskSummary,
         supported: collector.state.supported,
@@ -658,22 +545,13 @@ function formatSession(s) {
 
     // 库调用探针：LoAF 只能给到文件名，lib.js 里全是 (anonymous)，
     // 这一段直接给出「谁被调了多少次、共花了多少毫秒」
-    if (Array.isArray(s.moduleHints) && s.moduleHints.length) {
-        lines.push('');
-        lines.push('  压缩包定位（lib.js 里的模块片段）:');
-        for (const hint of s.moduleHints) {
-            lines.push(`    ${hint.key}  ${hint.ms} ms  → 模块 ${hint.moduleId}（+${hint.offsetInModule}）`);
-            lines.push(`      ${hint.snippet.slice(0, 110)}`);
-        }
-    }
-
     if (Array.isArray(s.probes) && s.probes.length) {
         lines.push('');
         lines.push('  库调用探针（真实渲染路径）:');
         for (const probe of s.probes) {
             lines.push(`    ${pad(probe.name, 34)} ${pad(`${probe.calls} 次`, 10)} ${pad(`${probe.totalMs} ms`, 12)} 每次 ${probe.perCallMs} ms`);
         }
-        const silent = (s.probeTargets || [])
+        const silent = ['DOMPurify.sanitize', 'Handlebars.compile']
             .filter((name) => !s.probes.some((probe) => probe.name === name));
         if (silent.length) {
             lines.push(`    未触发: ${silent.join('、')}（说明不是瓶颈）`);
@@ -685,6 +563,10 @@ function formatSession(s) {
         lines.push(`  脚本耗时      : ${L.scriptMs} ms   (${L.scriptShare ?? '?'}%)`);
         lines.push(`  样式+布局耗时 : ${L.styleLayoutMs} ms   (${L.styleLayoutShare ?? '?'}%)   ← 这部分 Rust 无法优化`);
         lines.push(`  其中强制重排  : ${L.forcedStyleAndLayoutMs} ms`);
+        lines.push('  ⚠️ 下面的「脚本来源」是**文件级**归因：浏览器只告诉我们代码在哪个文件里。');
+        lines.push('     实测它会严重偏离 —— 曾把 5616 ms 归给酒馆自带的 lib.js，而 V8 函数级采样里');
+        lines.push('     该文件只占 0.6%，真正的大头在扩展的 dist/index.js。要定位到函数，请用'); 
+        lines.push('     tools/ 目录下的 V8 采样脚本（见 README 的「精确定位」一节）。');
         if (L.topScripts?.length) {
             lines.push('  脚本耗时归因 Top:');
             for (const t of L.topScripts.slice(0, 6)) {
