@@ -86,7 +86,10 @@ function wrapMethod(target, key, name, { wrapResult = false } = {}) {
 function installLibraryProbes() {
     if (probesInstalled) return true;
     const okPurify = wrapMethod(window.DOMPurify, 'sanitize', 'DOMPurify.sanitize');
-    const okHandlebars = wrapMethod(window.Handlebars, 'compile', 'Handlebars.compile', { wrapResult: true });
+    // 只数「编译」次数，不包装它产出的模板函数：
+    // 编译本身就比渲染贵得多，而包装返回值（Object.assign 复制属性）有弄坏模板的风险，
+    // 对一个「测量工具」来说不值得 —— 宁可少一个数字，也不能把用户的页面搞坏。
+    const okHandlebars = wrapMethod(window.Handlebars, 'compile', 'Handlebars.compile');
     const okHljs = wrapMethod(window.hljs, 'highlightElement', 'hljs.highlightElement')
         || wrapMethod(window.hljs, 'highlight', 'hljs.highlight');
     probesInstalled = okPurify || okHandlebars || okHljs;
@@ -98,7 +101,8 @@ function installLibraryProbes() {
 }
 
 function startProbes() {
-    installLibraryProbes();
+    // 探针只是附加观测，任何异常都不该影响测量本身，更不该影响酒馆
+    try { installLibraryProbes(); } catch (error) { console.warn('[ST-Render-Profiler] 探针安装失败（已忽略）', error); }
     probeStats.clear();
     probesActive = true;
 }
@@ -547,7 +551,7 @@ function formatSession(s) {
         for (const probe of s.probes) {
             lines.push(`    ${pad(probe.name, 34)} ${pad(`${probe.calls} 次`, 10)} ${pad(`${probe.totalMs} ms`, 12)} 每次 ${probe.perCallMs} ms`);
         }
-        const silent = ['DOMPurify.sanitize', 'Handlebars.compile', 'Handlebars.compile → 渲染']
+        const silent = ['DOMPurify.sanitize', 'Handlebars.compile']
             .filter((name) => !s.probes.some((probe) => probe.name === name));
         if (silent.length) {
             lines.push(`    未触发: ${silent.join('、')}（说明不是瓶颈）`);
